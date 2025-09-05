@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  wordpress:
+    image: wordpress:latest
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    environment:
+      WORDPRESS_DB_HOST: mysql
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress_password
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - wordpress_data:/var/www/html
+      - wordpress_uploads:/var/www/html/wp-content/uploads
+      - wordpress_themes:/var/www/html/wp-content/themes
+      - wordpress_plugins:/var/www/html/wp-content/plugins
+    depends_on:
+      - mysql
+    networks:
+      - wordpress_network
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress_password
+      MYSQL_ROOT_PASSWORD: root_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - wordpress_network
+
+  backup:
+    build: .  # Build from the Dockerfile in current directory
+    # Or use pre-built image: image: your-registry/wordpress-backup:latest
+    restart: unless-stopped
+    environment:
+      # AWS S3 Configuration
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-wordpress-backups}
+      
+      # Database Configuration
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: wordpress
+      DB_USER: root
+      DB_PASSWORD: root_password
+      
+      # Backup Configuration
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-daily}  # hourly, daily, weekly, monthly, or custom cron
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      RUN_INITIAL_BACKUP: ${RUN_INITIAL_BACKUP:-false}
+      
+    volumes:
+      # Mount Docker socket for volume access
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      
+      # Alternative: Mount data directories directly
+      # - wordpress_uploads:/data/uploads:ro
+      # - wordpress_themes:/data/themes:ro
+      # - wordpress_plugins:/data/plugins:ro
+      
+      # Persistent log storage
+      - backup_logs:/var/log/backup
+      
+    depends_on:
+      - mysql
+      - wordpress
+    networks:
+      - wordpress_network
+
+volumes:
+  wordpress_data:
+  wordpress_uploads:
+  wordpress_themes:
+  wordpress_plugins:
+  mysql_data:
+  backup_logs:
+
+networks:
+  wordpress_network:
+    driver: bridge
