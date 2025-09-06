@@ -1,75 +1,79 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# Set default backup interval if not provided
-BACKUP_INTERVAL="${BACKUP_INTERVAL:-daily}"
+# Set default backup interval
+: "${BACKUP_INTERVAL:=daily}"
 
-# Configure AWS if credentials are provided
-if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
-    aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-    aws configure set default.region "${AWS_DEFAULT_REGION:-eu-central-1}"
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/cron.log
+}
+
+# Configure MinIO client if credentials are provided
+if [ -n "$S3_ACCESS_KEY" ] && [ -n "$S3_SECRET_KEY" ]; then
+    if [ -n "$S3_ENDPOINT_URL" ]; then
+        # Custom S3 endpoint
+        mc alias set s3provider "$S3_ENDPOINT_URL" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" || {
+            log "ERROR: Failed to configure MinIO client for custom S3 endpoint: $S3_ENDPOINT_URL"
+            exit 1
+        }
+        log "Configured MinIO client for custom S3 endpoint: $S3_ENDPOINT_URL"
+    else
+        # Generic S3
+        mc alias set s3provider "https://s3.amazonaws.com" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" --api S3v4 || {
+            log "ERROR: Failed to configure MinIO client for generic S3"
+            exit 1
+        }
+        log "Configured MinIO client for generic S3"
+    fi
+else
+    log "ERROR: S3_ACCESS_KEY and S3_SECRET_KEY are required"
+    exit 1
 fi
 
 # Create cron schedule based on interval
 case "$BACKUP_INTERVAL" in
     "hourly")
-        echo "0 * * * * /usr/local/bin/backup-script.sh" > /tmp/crontab
+        CRON_SCHEDULE="0 * * * *"
         ;;
     "daily")
-        echo "0 2 * * * /usr/local/bin/backup-script.sh" > /tmp/crontab
+        CRON_SCHEDULE="0 2 * * *"
         ;;
     "weekly")
-        echo "0 2 * * 0 /usr/local/bin/backup-script.sh" > /tmp/crontab
+        CRON_SCHEDULE="0 2 * * 0"
         ;;
     "monthly")
-        echo "0 2 1 * * /usr/local/bin/backup-script.sh" > /tmp/crontab
+        CRON_SCHEDULE="0 2 1 * *"
         ;;
     *)
-        # Custom cron expression
-        echo "$BACKUP_INTERVAL /usr/local/bin/backup-script.sh" > /tmp/crontab
+        CRON_SCHEDULE="$BACKUP_INTERVAL"
         ;;
 esac
 
-# Add environment variables to crontab for the backup script
-{
-    echo "MYSQL_HOST=${MYSQL_HOST:-db}"
-    echo "MYSQL_USER=${MYSQL_USER:-root}"
-    echo "MYSQL_PASSWORD=${MYSQL_PASSWORD}"
-    echo "MYSQL_DATABASE=${MYSQL_DATABASE:-wordpress}"
-    echo "S3_BUCKET=${S3_BUCKET:-wordpress-backups}"
-    echo "RETENTION_DAYS=${RETENTION_DAYS:-7}"
-    echo "WP_CONTENT_PATH=${WP_CONTENT_PATH:-/var/www/html}"
-    echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-    echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-    echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-eu-central-1}"
-    echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    echo ""
-    cat /tmp/crontab
-} > /tmp/crontab_with_env
-
-# Install the crontab
-crontab /tmp/crontab_with_env
-
-# Create log directory
-mkdir -p /var/log/backup
+# Setup cron
+log "Setting up cron job with schedule: ${CRON_SCHEDULE}"
+echo "${CRON_SCHEDULE} /backup/backup-script.sh >> /var/log/cron.log 2>&1" > /var/spool/cron/crontabs/root
+chmod 600 /var/spool/cron/crontabs/root
 
 # Log startup information
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] WordPress Backup Service Started"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Backup interval: $BACKUP_INTERVAL"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] S3 Bucket: ${S3_BUCKET:-wordpress-backups}"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Retention: ${RETENTION_DAYS:-7} days"
-
-# Show the installed crontab for debugging
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Installed crontab:"
-crontab -l
+log "WordPress Backup Service Started"
+log "Backup interval: $BACKUP_INTERVAL"
+log "S3 Bucket: ${S3_BUCKET:-wordpress-backups}"
+log "S3 Endpoint: ${S3_ENDPOINT_URL:-default}"
+log "Retention: ${RETENTION_DAYS:-7} days"
 
 # Run initial backup if requested
 if [ "$RUN_INITIAL_BACKUP" = "true" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running initial backup..."
-    /usr/local/bin/backup-script.sh
+    log "Running initial backup..."
+    /backup/backup-script.sh || {
+        log "ERROR: Initial backup failed"
+        exit 1
+    }
 fi
 
-# Start cron daemon
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting cron daemon..."
-exec crond -f -l 2
+# Start cron in background
+log "Starting cron..."
+crond
+
+# Keep container alive
+tail -f /var/log/cron.log

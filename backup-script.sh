@@ -3,6 +3,9 @@ set -e
 
 # Configuration from environment variables
 S3_BUCKET="${S3_BUCKET:-wordpress-backups}"
+S3_ENDPOINT_URL="${S3_ENDPOINT_URL:-}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 BACKUP_DIR="/backup/data"
 DATE=$(date +"%Y-%m-%d_%H-%M-%S")
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
@@ -10,6 +13,7 @@ LOG_FILE="/var/log/backup/backup-${DATE}.log"
 
 # Database configuration
 MYSQL_HOST="${MYSQL_HOST:-db}"
+MYSQL_PORT="${MYSQL_PORT:-3306}"
 MYSQL_USER="${MYSQL_USER:-root}"
 MYSQL_PASSWORD="${MYSQL_PASSWORD}"
 MYSQL_DATABASE="${MYSQL_DATABASE:-wordpress}"
@@ -48,13 +52,38 @@ log "Starting WordPress backup process..."
 CURRENT_BACKUP_DIR="${BACKUP_DIR}/${DATE}"
 mkdir -p "$CURRENT_BACKUP_DIR"
 
+# Use mariadb-dump (newer) or fall back to mysqldump
+DUMP_CMD="mysqldump"
+if command -v mariadb-dump >/dev/null 2>&1; then
+    DUMP_CMD="mariadb-dump"
+fi
+
+# Wait for database to be ready
+log "Waiting for database connection at $MYSQL_HOST:3306..."
+for i in {1..30}; do
+    if nc -z "$MYSQL_HOST" 3306 2>/dev/null; then
+        log "Database connection established"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        error_exit "Database connection failed after 30 attempts to $MYSQL_HOST:3306"
+    fi
+    log "Attempt $i/30: Waiting for database..."
+    sleep 2
+done
+
 # Database backup
 log "Dumping MySQL database..."
 if [ -z "$MYSQL_PASSWORD" ]; then
     error_exit "MYSQL_PASSWORD environment variable is required"
 fi
 
-mysqldump -h "$MYSQL_HOST" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" > "${CURRENT_BACKUP_DIR}/db.sql" || error_exit "Failed to dump database"
+$DUMP_CMD -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+    --skip-ssl \
+    --single-transaction --routines --triggers \
+    "$MYSQL_DATABASE" > "${CURRENT_BACKUP_DIR}/db.sql" || error_exit "Failed to dump database"
+
+log "Database dump completed successfully"
 
 # WordPress content backup
 log "Archiving WordPress content..."
@@ -65,64 +94,14 @@ fi
 tar czf "${CURRENT_BACKUP_DIR}/wp-content.tar.gz" -C "$WP_CONTENT_PATH" . || error_exit "Failed to archive WordPress content"
 
 # Upload to S3
-log "Uploading backups to S3 bucket: $S3_BUCKET"
-aws s3 cp "$CURRENT_BACKUP_DIR/" "s3://$S3_BUCKET/wordpress/" --recursive || error_exit "Failed to upload to S3"
+log "Uploading backup to S3 bucket: $S3_BUCKET..."
+mc cp "${CURRENT_BACKUP_DIR}/db.sql" "s3provider/$S3_BUCKET/$DATE/db.sql" || error_exit "Failed to upload database backup to S3"
+mc cp "${CURRENT_BACKUP_DIR}/wp-content.tar.gz" "s3provider/$S3_BUCKET/$DATE/wp-content.tar.gz" || error_exit "Failed to upload WordPress content to S3"
+log "Backup successfully uploaded to S3"
 
-# Create backup manifest
-log "Creating backup manifest..."
-DB_SIZE=$(du -sh "${CURRENT_BACKUP_DIR}/db.sql" | cut -f1)
-CONTENT_SIZE=$(du -sh "${CURRENT_BACKUP_DIR}/wp-content.tar.gz" | cut -f1)
-TOTAL_SIZE=$(du -sh "$CURRENT_BACKUP_DIR" | cut -f1)
+# Clean up old backups based on retention policy
+log "Cleaning up backups older than $RETENTION_DAYS days..."
+mc find "s3provider/$S3_BUCKET" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}" || log "Warning: Failed to clean up old backups"
+log "Old backup cleanup completed"
 
-cat > "${CURRENT_BACKUP_DIR}/manifest-${DATE}.json" << EOF
-{
-    "backup_date": "$DATE",
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-    "files": {
-        "database": "db.sql",
-        "wp_content": "wp-content.tar.gz"
-    },
-    "sizes": {
-        "database": "$DB_SIZE",
-        "wp_content": "$CONTENT_SIZE",
-        "total": "$TOTAL_SIZE"
-    },
-    "mysql_host": "$MYSQL_HOST",
-    "mysql_database": "$MYSQL_DATABASE",
-    "wp_content_path": "$WP_CONTENT_PATH"
-}
-EOF
-
-aws s3 cp "${CURRENT_BACKUP_DIR}/manifest-${DATE}.json" "s3://$S3_BUCKET/wordpress/" || log "WARNING: Failed to upload manifest"
-
-# Clean up old local backups
-log "Cleaning old local backups (keeping last $RETENTION_DAYS)..."
-ls -1dt "$BACKUP_DIR"/* 2>/dev/null | tail -n +$((RETENTION_DAYS + 1)) | xargs rm -rf || true
-
-# Clean up old S3 backups if retention is set
-if [ "$RETENTION_DAYS" -gt 0 ]; then
-    log "Cleaning up S3 backups older than $RETENTION_DAYS days..."
-    
-    # Calculate cutoff date (format: YYYY-MM-DD)
-    cutoff_date=$(date -d "$RETENTION_DAYS days ago" +%Y-%m-%d)
-    
-    # List and delete old backups from S3
-    aws s3 ls "s3://$S3_BUCKET/wordpress/" --recursive | while read -r line; do
-        # Extract filename and date from S3 listing
-        file_path=$(echo "$line" | awk '{print $4}')
-        file_date=$(echo "$file_path" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | head -1)
-        
-        if [ -n "$file_date" ] && [ "$file_date" \< "$cutoff_date" ]; then
-            log "Deleting old S3 backup: $file_path"
-            aws s3 rm "s3://$S3_BUCKET/wordpress/$file_path" || log "WARNING: Failed to delete $file_path"
-        fi
-    done
-fi
-
-log "Backup completed successfully!"
-log "Local backup: $CURRENT_BACKUP_DIR"
-log "S3 location: s3://$S3_BUCKET/wordpress/"
-log "Database size: $DB_SIZE"
-log "Content size: $CONTENT_SIZE"
-log "Total backup size: $TOTAL_SIZE"
-log "Log file: $LOG_FILE"
+log "WordPress backup process completed successfully"
